@@ -1,229 +1,819 @@
-import streamlit as st
-import google.generativeai as genai
-import pandas as pd
-from PIL import Image
+import gradio as gr
+import os
+import threading
+import time
+import json
+import sqlite3
+import numpy as np
+import scipy.io.wavfile as wav
+import whisper
+from ollama import Client
+import pyttsx3
 import PyPDF2
-import plotly.express as px
+import chromadb
+from sentence_transformers import SentenceTransformer
+from PyPDF2 import PdfReader
+import yt_dlp
 import requests
 from bs4 import BeautifulSoup
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from PIL import Image
+import io
 
-# 1. 화면 기본 설정 및 세션 상태(메모리) 초기화
-st.set_page_config(page_title="CEO 통합 경영 대시보드", layout="wide")
-st.title("📊 CEO 경영 의사결정 및 K-IFRS 회계 통합 워크스테이션")
+import openpyxl
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  
-if "extracted_data" not in st.session_state:
-    st.session_state.extracted_data = ""  
-if "current_df" not in st.session_state:
-    st.session_state.current_df = None  
-if "ceo_dashboard_result" not in st.session_state:
-    st.session_state.ceo_dashboard_result = ""
+#-- python functions
 
-# 2. 사이드바 설정 (API 및 SMTP 메일 보안 터널 연동)
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-st.sidebar.markdown("---")
-st.sidebar.subheader("📧 사내 메일 송신 설정 (보안 패치 완료)")
-smtp_server = st.sidebar.text_input("SMTP 서버 (예: ://naver.com)", "://naver.com")
-smtp_port = st.sidebar.number_input("SMTP 포트", value=587)
-sender_email = st.sidebar.text_input("보내는 사람 메일 주소")
-sender_password = st.sidebar.text_input("보내는 사람 보안 토큰 (앱 비밀번호)", type="password")
-receiver_email = st.sidebar.text_input("받는 사람 메일 주소 (사장님 보고용)")
+# --- Add these functions near the top after imports ---
+import pandas as pd
 
-if api_key:
-    genai.configure(api_key=api_key)
+def process_excel(file):
+    if file is None:
+        return "No file uploaded.", None
+    
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        df = pd.read_excel(file.name)
+        info = f"📊 File loaded: {file.name}\nRows: {df.shape[0]}, Columns: {df.shape[1]}\nColumns: {', '.join(df.columns.tolist())}"
+        preview = df.head(10).to_string()
+        return info, preview
     except Exception as e:
-        st.sidebar.error(f"모델 로드 실패: {e}")
-        model = None
+        return f"❌ Error: {e}", None
 
-    # 3. 다중 리소스 입력 파트
-    st.subheader("📥 다중 경영 리소스 입력 파트")
-    col_f1, col_f2 = st.columns(2)
+def analyze_financials(file):
+    if file is None:
+        return "No file uploaded.", ""
     
-    is_image = False
-    image_obj = None
-    
-    with col_f1:
-        uploaded_file = st.file_uploader("엑셀 장부, 회계 PDF, 제품 사진 등을 업로드하세요", type=["png", "jpg", "jpeg", "csv", "xlsx", "pdf", "txt"])
-        if uploaded_file:
-            if uploaded_file.name.endswith(('png', 'jpg', 'jpeg')):
-                image_obj = Image.open(uploaded_file)
-                st.image(image_obj, caption="업로드된 이미지 프리뷰", use_container_width=True)
-                is_image = True
-            elif uploaded_file.name.endswith(('csv', 'xlsx')):
-                try:
-                    raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file, engine='openpyxl')
-                    
-                    # [Arrow 호환성 안전 패치] 문자열 캐스팅으로 화면 크래시 차단
-                    preview_df = raw_df.astype(str)
-                    st.session_state.current_df = raw_df 
-                    
-                    st.write("📊 데이터 상위 5행 미리보기 (Arrow 호환성 패치 완료)")
-                    st.dataframe(preview_df.head(5)) 
-                    
-                    # 🌟 [429 무료 쿼터 차단벽 우회: 리스크 가중치 우선순위 정렬 필터 모듈]
-                    if len(raw_df) > 50:
-                        st.sidebar.info("🔍 대용량 데이터 감지: AI 쿼터 보호를 위해 리스크 가중치 정렬 분석을 가동합니다.")
-                        sort_df = raw_df.copy()
-                        if 'Status' in sort_df.columns:
-                            # Cancelled 및 Pending 데이터를 최상단으로 정렬하여 의사결정 효율 극대화
-                            sort_df['__risk_score__'] = sort_df['Status'].apply(lambda x: 0 if str(x).strip().lower() in ['cancelled', 'pending'] else 1)
-                            sort_df = sort_df.sort_values(by='__risk_score__').drop(columns=['__risk_score__'])
-                        elif 'Total' in sort_df.columns:
-                            # 비정상 수치 및 마이너스 매출을 최상단으로 우선 정렬
-                            sort_df = sort_df.sort_values(by='Total')
-                        
-                        sliced_df = sort_df.head(50)
-                        st.sidebar.warning(f"⚠️ 429 방어 완료: 가장 치명적인 리스크 데이터 50개 행을 추출해 AI에게 전달했습니다. (전체 행: {len(raw_df)})")
-                    else:
-                        sliced_df = raw_df
-                    
-                    st.session_state.extracted_data += f"\n[엑셀 데이터 (핵심 리스크 50행 분석)]\n{sliced_df.to_markdown(index=False)}"
-                except Exception as e:
-                    st.error(f"데이터 파싱 에러: {e}")
-            elif uploaded_file.name.endswith('pdf'):
-                try:
-                    pdf_reader = PyPDF2.PdfReader(uploaded_file)
-                    text = "".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
-                    st.session_state.extracted_data += f"\n[PDF 데이터]\n{text}"
-                    st.success("PDF 텍스트 추출 완료")
-                except Exception as e:
-                    st.error(f"PDF 파싱 에러: {e}")
-
-    with col_f2:
-        web_url = st.text_input("시장 동향 분석용 뉴스 URL을 입력하세요:")
-        if st.button("🌐 뉴스 데이터 스크랩") and web_url:
-            try:
-                res = requests.get(web_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content, 'html.parser')
-                    for t in soup(["script", "style", "nav", "footer", "header"]): t.decompose()
-                    st.session_state.extracted_data += f"\n[뉴스 데이터]\n{soup.get_text(separator=' ', strip=True)[:3000]}"
-                    st.success("뉴스 데이터 결합 완료")
-            except Exception as e:
-                st.error(f"크롤링 에러: {e}")
-    # --- 4. 데이터 자동 동적 시각화 모듈 (고급 비즈니스 차트군) ---
-    if st.session_state.current_df is not None:
-        st.markdown("---")
-        st.subheader("📊 실시간 데이터 동적 시각화 패널")
-        cols = st.session_state.current_df.columns.tolist()
+    try:
+        df = pd.read_excel(file.name)
+        results = []
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols[:5]:
+            total = df[col].sum()
+            avg = df[col].mean()
+            results.append(f"{col}: Sum={total:,.2f}, Avg={avg:,.2f}")
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            x_axis = st.selectbox("X축 (또는 그룹화 기준) 선택", cols)
-        with col2:
-            y_axis = st.selectbox("Y축 (수치형 데이터) 선택", cols)
-        with col3:
-            chart_type = st.selectbox("차트 종류", [
-                "막대 그래프 (Bar)", 
-                "누적 막대 그래프 (Stacked Bar)", 
-                "선 그래프 (Line)", 
-                "영역 차트 (Area)",
-                "산점도 (Scatter)", 
-                "원형 차트 (Pie)", 
-                "도넛 차트 (Donut)"
-            ])
+        missing = df.isnull().sum()
+        missing_str = "\n".join([f"{col}: {count} missing" for col, count in missing.items() if count > 0])
+        
+        return "\n".join(results), missing_str if missing_str else "No missing values found."
+    except Exception as e:
+        return f"❌ Error: {e}", ""
+
+def generate_report(file):
+    if file is None:
+        return "No file uploaded.", ""
+    
+    try:
+        df = pd.read_excel(file.name)
+        report = []
+        report.append("=" * 50)
+        report.append("FINANCIAL DATA REPORT")
+        report.append("=" * 50)
+        report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        report.append(f"File: {file.name}")
+        report.append(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+        report.append("")
+        report.append("SUMMARY STATISTICS")
+        report.append("-" * 30)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols[:5]:
+            report.append(f"{col}:")
+            report.append(f"  Mean: {df[col].mean():,.2f}")
+            report.append(f"  Median: {df[col].median():,.2f}")
+            report.append(f"  Min: {df[col].min():,.2f}")
+            report.append(f"  Max: {df[col].max():,.2f}")
+        
+        output_file = f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        df.to_excel(output_file, index=False)
+        return "\n".join(report), output_file
+    except Exception as e:
+        return f"❌ Error: {e}", ""
+
+#-- end python functions
+
+
+# --- Configuration ---
+client = Client(host='http://localhost:11434')
+speaker_on = True
+MEMORY_FILE = "secretary_learning_log.txt"
+DB_FILE = "secretary.db"
+MEMORY_LIMIT = 10
+
+# --- Initialize SQLite ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_history
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp TEXT,
+                  role TEXT,
+                  content TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- Load Whisper Model ---
+print("Loading Whisper model...")
+whisper_model = whisper.load_model("base")
+print("Whisper model loaded.")
+
+# --- RAG Setup ---
+rag_model = None
+rag_collection = None
+rag_persist_dir = "./chroma_db"
+
+# --- Memory Functions ---
+def get_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def save_to_memory(role, content):
+    timestamp = get_timestamp()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO chat_history (timestamp, role, content) VALUES (?, ?, ?)",
+              (timestamp, role, content))
+    conn.commit()
+    conn.close()
+    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {role}: {content}\n")
+
+def load_memory(limit=20):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT timestamp, role, content FROM chat_history ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return list(reversed(rows))
+
+def clear_memory():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM chat_history")
+    conn.commit()
+    conn.close()
+    if os.path.exists(MEMORY_FILE):
+        os.remove(MEMORY_FILE)
+
+# --- TTS Function ---
+def speak(text):
+    if not speaker_on:
+        return
+
+    def _speak():
+        try:
+            engine = pyttsx3.init()
+            try:
+                voice_id = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_EN-US_ZIRA_11.0"
+                engine.setProperty('voice', voice_id)
+            except:
+                pass
+            engine.setProperty('rate', 170)
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"⚠️ TTS Error: {e}")
+        finally:
+            try:
+                engine.stop()
+            except:
+                pass
+
+    thread = threading.Thread(target=_speak)
+    thread.daemon = True
+    thread.start()
+
+# --- Process Voice Input ---
+def process_voice(audio, sound_on):
+    if audio is None:
+        return "No audio received.", ""
+
+    try:
+        sample_rate, audio_data = audio
+        temp_file = "temp_voice.wav"
+        wav.write(temp_file, sample_rate, audio_data.astype('int16'))
+
+        result = whisper_model.transcribe(temp_file)
+        transcript = result["text"]
+        print(f"🗣️ User said: {transcript}")
+
+        save_to_memory("user", transcript)
+
+        response = client.chat(
+            model='llama3',
+            messages=[{'role': 'user', 'content': transcript}]
+        )
+        answer = response['message']['content']
+
+        save_to_memory("assistant", answer)
+
+        if sound_on:
+            speak(answer)
+
+        os.remove(temp_file)
+        return transcript, answer
+
+    except Exception as e:
+        error_msg = f"❌ Error: {e}"
+        print(error_msg)
+        return error_msg, ""
+
+# --- RAG Functions ---
+def load_rag_model():
+    global rag_model
+    if rag_model is None:
+        rag_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return rag_model
+
+def get_rag_collection():
+    global rag_collection
+    if rag_collection is None:
+        try:
+            client_db = chromadb.PersistentClient(path=rag_persist_dir)
+            rag_collection = client_db.get_collection("documents")
+        except:
+            rag_collection = None
+    return rag_collection
+
+def index_pdf(file):
+    global rag_collection, rag_model
+    if file is None:
+        return "No file uploaded."
+
+    try:
+        reader = PdfReader(file.name)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text()
+
+        chunk_size = 500
+        chunks = [full_text[i:i+chunk_size] for i in range(0, len(full_text), chunk_size)]
+
+        model = load_rag_model()
+        embeddings = model.encode(chunks)
+
+        client_db = chromadb.PersistentClient(path=rag_persist_dir)
+        try:
+            collection = client_db.get_collection("documents")
+            next_id = collection.count()
+            ids = [str(next_id + i) for i in range(len(chunks))]
+            collection.add(
+                documents=chunks,
+                embeddings=embeddings.tolist(),
+                ids=ids
+            )
+            rag_collection = collection
+            return f"✅ Added {len(chunks)} chunks to existing index."
+        except:
+            collection = client_db.create_collection("documents")
+            collection.add(
+                documents=chunks,
+                embeddings=embeddings.tolist(),
+                ids=[str(i) for i in range(len(chunks))]
+            )
+            rag_collection = collection
+            return f"✅ Created new index with {len(chunks)} chunks."
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def ask_document(query):
+    global rag_collection, rag_model
+    if rag_collection is None:
+        rag_collection = get_rag_collection()
+        if rag_collection is None:
+            return "⚠️ No document indexed. Please upload a PDF first."
+
+    try:
+        model = load_rag_model()
+        query_embedding = model.encode([query])
+        results = rag_collection.query(
+            query_embeddings=query_embedding.tolist(),
+            n_results=3
+        )
+        context = "\n\n".join(results['documents'][0])
+        prompt = f"Answer the following question based only on the provided context.\n\nContext:\n{context}\n\nQuestion: {query}"
+        response = client.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+        answer = response['message']['content']
+        if speaker_on:
+            speak(answer)
+        save_to_memory("assistant", f"RAG: {answer}")
+        return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def clear_rag_index():
+    global rag_collection
+    try:
+        client_db = chromadb.PersistentClient(path=rag_persist_dir)
+        client_db.delete_collection("documents")
+        rag_collection = None
+        return "🗑️ RAG index cleared."
+    except:
+        return "⚠️ No index to clear."
+
+# --- Web Summary ---
+def summarize_web(url):
+    if not url.startswith('http'):
+        return "⚠️ Invalid URL."
+
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return f"❌ Status: {response.status_code}"
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator=' ', strip=True)[:3000]
+
+        prompt = f"Summarize this webpage in 3-5 sentences:\n\n{text}"
+        response = client.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+        answer = response['message']['content']
+
+        if speaker_on:
+            speak(answer)
+
+        save_to_memory("assistant", f"Web Summary: {answer}")
+        return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+# --- YouTube Audio ---
+def summarize_youtube_audio(url):
+    try:
+        # ydl_opts = {
+        #    'format': 'bestaudio/best',
+        #    'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+        #    'outtmpl': 'audio.%(ext)s',
+        #    'quiet': True,
+        #}
+      
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+            'outtmpl': 'audio.%(ext)s',
+            'quiet': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'extractor_args': {
+                 'youtube': {
+                       'skip': ['dash', 'hls'],
+                       'player_client': ['android']
+                  }
+             }
+         }
+
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        model = whisper.load_model("base")
+        result = model.transcribe("audio.mp3")
+        transcript = result["text"]
+
+        prompt = f"Summarize this transcript in a few sentences:\n\n{transcript}"
+        response = client.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+        answer = response['message']['content']
+
+        if speaker_on:
+            speak(answer)
+
+        save_to_memory("assistant", f"YouTube Summary: {answer}")
+        os.remove("audio.mp3")
+        return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+# --- Image Analysis ---
+def analyze_image_file(file):
+    if file is None:
+        return "No image uploaded."
+
+    try:
+        with open(file.name, 'rb') as img_file:
+            response = client.generate(
+                model='llava',
+                prompt="Describe this image in detail.",
+                images=[img_file.read()]
+            )
+            answer = response['response']
+            if speaker_on:
+                speak(answer)
+            save_to_memory("assistant", f"Image: {answer}")
+            return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def analyze_image_url(url):
+    if not url.startswith('http'):
+        return "⚠️ Invalid URL."
+
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10, stream=True)
+        if response.status_code != 200:
+            return f"❌ Status: {response.status_code}"
+
+        content_type = response.headers.get('content-type', '')
+        if not content_type.startswith('image'):
+            return "⚠️ Not an image URL."
+
+        img_bytes = response.content
+        response = client.generate(
+            model='llava',
+            prompt="Describe this image in detail.",
+            images=[img_bytes]
+        )
+        answer = response['response']
+        if speaker_on:
+            speak(answer)
+        save_to_memory("assistant", f"Image URL: {answer}")
+        return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def analyze_image_webcam(image):
+    if image is None:
+        return "No image captured."
+
+    try:
+        pil_image = Image.fromarray(image.astype('uint8'))
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='JPEG')
+        img_bytes = img_byte_arr.getvalue()
+
+        response = client.generate(
+            model='llava',
+            prompt="Describe this image in detail.",
+            images=[img_bytes]
+        )
+        answer = response['response']
+        if speaker_on:
+            speak(answer)
+        save_to_memory("assistant", f"Webcam: {answer}")
+        return answer
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+# --- Chat Function with Memory ---
+def chat_with_memory(message, history):
+    if not message:
+        return ""
+
+    save_to_memory("user", message)
+
+    if message.lower().startswith("rag:"):
+        query = message[4:].strip()
+        answer = ask_document(query)
+    else:
+        recent = load_memory(MEMORY_LIMIT)
+        context = [{"role": row[1], "content": row[2]} for row in recent]
+        context.append({"role": "user", "content": message})
+
+        response = client.chat(model='llama3', messages=context)
+        answer = response['message']['content']
+
+    save_to_memory("assistant", answer)
+    return answer
+
+# --- Export Log ---
+def export_log_old():
+    log_file = MEMORY_FILE
+    if os.path.exists(log_file):
+        with open(log_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return content, f"secretary_log_{timestamp}.txt"
+    else:
+        rows = load_memory(50)
+        if rows:
+            content = "\n".join([f"[{row[0]}] {row[1]}: {row[2]}" for row in rows])
+            return content, f"secretary_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        return "No log data found.", None
+
+def export_log():
+    log_file = MEMORY_FILE
+    if os.path.exists(log_file):
+        with open(log_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"secretary_log_{timestamp}.txt"
+        # Write a temporary file that Gradio can pick up
+        temp_path = os.path.join(os.getcwd(), filename)
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return content, temp_path
+    else:
+        rows = load_memory(50)
+        if rows:
+            content = "\n".join([f"[{row[0]}] {row[1]}: {row[2]}" for row in rows])
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"secretary_log_{timestamp}.txt"
+            temp_path = os.path.join(os.getcwd(), filename)
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return content, temp_path
+        return "No log data found.", None
+
+
+# -- show excel code
+def show_excel_code_old():
+    """Returns the Python code used for the current Excel analysis."""
+    code = '''
+import pandas as pd
+
+# Load the Excel file portfolio->test_data 2608062034
+df = pd.read_excel('test_data.xlsx')
+
+# Basic Info
+print(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+print(f"Columns: {', '.join(df.columns.tolist())}")
+
+# Preview
+print(df.head())
+
+# Numeric statistics
+numeric_cols = df.select_dtypes(include=[np.number]).columns
+print(df[numeric_cols].describe())
+
+# Group by (example)
+# sector_summary = df.groupby('Sector').agg({'Revenue': 'sum', 'Profit': 'mean'})
+# print(sector_summary)
+'''
+    return code
+
+#new show_excel_code 2608062021
+
+def show_excel_code():
+    code = '''
+import pandas as pd
+import numpy as np
+
+# Load the Excel file
+df = pd.read_excel('your_file.xlsx')
+
+# Basic Info
+print(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+print(f"Columns: {', '.join(df.columns.tolist())}")
+
+# Preview
+print(df.head())
+
+# Numeric statistics
+numeric_cols = df.select_dtypes(include=[np.number]).columns
+print(df[numeric_cols].describe())
+
+# --- ADD YOUR CUSTOM CODE BELOW ---
+# Group by example
+# sector_summary = df.groupby('Sector').agg({'Revenue': 'sum', 'Profit': 'mean'})
+# print(sector_summary)
+
+# Filter example
+# tech_companies = df[df['Sector'] == 'Tech']
+# print(tech_companies)
+
+# Calculate new column example
+# df['Growth'] = (df['Revenue_2024'] - df['Revenue_2023']) / df['Revenue_2023'] * 100
+'''
+    return code
+
+# copy code to clipboard
+def copy_code():
+    code = show_excel_code()
+    # This will be handled by Gradio's gr.Code component
+    return code
+
+
+# --- Gradio UI ---
+def respond(message, history, sound_on):
+    if not message:
+        return "", history
+
+    response = chat_with_memory(message, history)
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": response})
+
+    if sound_on:
+        speak(response)
+
+    return "", history
+
+# --- Build UI ---
+with gr.Blocks(title="Secretary 2026", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 📄 Secretary 2026 — Full Edition")
+
+    with gr.Row():
+        sound_toggle = gr.Checkbox(label="🔊 Sound", value=True)
+        clear_memory_btn = gr.Button("🗑️ Clear Memory")
+
+    with gr.Tabs():
+        with gr.TabItem("💬 Chat"):
+            chatbot = gr.Chatbot(height=400)
+            with gr.Row():
+                msg = gr.Textbox(label="Ask your secretary...", placeholder="Type your message...", scale=4, elem_id="msg_textbox")
+                send_btn = gr.Button("📤 Send", scale=1)
+            clear_chat_btn = gr.Button("🗑️ Clear Chat")
+
+            send_btn.click(respond, [msg, chatbot, sound_toggle], [msg, chatbot])
+            msg.submit(respond, [msg, chatbot, sound_toggle], [msg, chatbot])
+            clear_chat_btn.click(lambda: ([], []), None, [chatbot, chatbot])
+
+        with gr.TabItem("🎤 Voice"):
+            gr.Markdown("Speak into your microphone.")
+            with gr.Row():
+                voice_input = gr.Audio(sources=["microphone"], type="numpy", label="🎤 Click to Record")
+            with gr.Row():
+                transcript_output = gr.Textbox(label="📝 Transcript", interactive=False, lines=3)
+                response_output = gr.Textbox(label="💬 Response", interactive=False, lines=6)
+            voice_input.change(process_voice, inputs=[voice_input, sound_toggle], outputs=[transcript_output, response_output])
+
+        with gr.TabItem("📄 RAG"):
+            gr.Markdown("Upload a PDF and ask questions.")
+            with gr.Row():
+                pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"])
+                index_btn = gr.Button("📥 Index")
+                index_output = gr.Textbox(label="Status", interactive=False)
+            with gr.Row():
+                rag_query = gr.Textbox(label="Question")
+                rag_btn = gr.Button("🔍 Ask")
+                rag_output = gr.Textbox(label="Answer", interactive=False)
+
+            index_btn.click(index_pdf, [pdf_file], [index_output])
+            rag_btn.click(ask_document, [rag_query], [rag_output])
+
+        with gr.TabItem("🌐 Web"):
+            with gr.Row():
+                web_url = gr.Textbox(label="URL")
+                web_btn = gr.Button("📄 Summarize")
+            web_output = gr.Textbox(label="Summary", interactive=False)
+            web_btn.click(summarize_web, [web_url], [web_output])
+
+        with gr.TabItem("🎥 YouTube"):
+            with gr.Row():
+                yt_url = gr.Textbox(label="YouTube URL")
+                yt_btn = gr.Button("📝 Summarize")
+            yt_output = gr.Textbox(label="Summary", interactive=False)
+            yt_btn.click(summarize_youtube_audio, [yt_url], [yt_output])
+
+        with gr.TabItem("🖼️ Image"):
+            with gr.Tabs():
+                with gr.TabItem("File"):
+                    img_file = gr.File(label="Upload Image")
+                    file_btn = gr.Button("🔍 Analyze")
+                    file_output = gr.Textbox(label="Description", interactive=False)
+                    file_btn.click(analyze_image_file, [img_file], [file_output])
+
+                with gr.TabItem("URL"):
+                    img_url = gr.Textbox(label="Image URL")
+                    url_btn = gr.Button("🔍 Analyze")
+                    url_output = gr.Textbox(label="Description", interactive=False)
+                    url_btn.click(analyze_image_url, [img_url], [url_output])
+
+                with gr.TabItem("Webcam"):
+                    webcam_input = gr.Image(sources=["webcam"], label="Take a Photo")
+                    webcam_btn = gr.Button("📸 Capture")
+                    webcam_output = gr.Textbox(label="Description", interactive=False)
+                    webcam_btn.click(analyze_image_webcam, [webcam_input], [webcam_output])
+
+        with gr.TabItem("🧠 Memory"):
+            gr.Markdown("Recent conversation history.")
+            memory_output = gr.Textbox(label="Recent Messages", lines=20, interactive=False)
+            refresh_btn = gr.Button("🔄 Refresh")
+
+            def show_memory():
+                rows = load_memory(20)
+                if not rows:
+                    return "No memory yet."
+                return "\n".join([f"[{row[0]}] {row[1]}: {row[2]}" for row in rows])
+
+            refresh_btn.click(show_memory, outputs=memory_output)
+
+# excel tab
+
+# === EXCEL SUITE TAB replaced===
+    # === EXCEL SUITE TAB ===
+        with gr.TabItem("📊 Excel Suite"):
+            gr.Markdown("# Excel Financial Analysis Suite")
+    
+            with gr.Tabs():
+               # --- Preview Tab ---
+                with gr.TabItem("📤 Upload & Preview"):
+                    gr.Markdown("Upload an Excel file to preview its contents")
+                    excel_file = gr.File(label="Upload Excel (.xlsx)", file_types=[".xlsx"])
+                    excel_btn = gr.Button("📊 Preview")
+                    excel_info = gr.Textbox(label="File Info", lines=5, interactive=False)
+                    excel_preview = gr.Textbox(label="Preview", lines=10, interactive=False)
+                    excel_btn.click(process_excel, [excel_file], [excel_info, excel_preview])
+        
+              # --- Financial Analysis Tab ---
+                with gr.TabItem("📊 Financial Analysis"):
+                    gr.Markdown("Upload financial data for statistical analysis")
+                    fin_file = gr.File(label="Upload Excel", file_types=[".xlsx"])
+                    fin_btn = gr.Button("📊 Analyze Financials")
+                    fin_stats = gr.Textbox(label="Statistics", lines=10, interactive=False)
+                    fin_missing = gr.Textbox(label="Missing Data", lines=5, interactive=False)
+                    fin_btn.click(analyze_financials, [fin_file], [fin_stats, fin_missing])
+        
+              # --- Show Code Tab (with copy built-in via gr.Code) ---
+                with gr.TabItem("📋 Show Code"):
+                    gr.Markdown("Click the button below to see the Python code used for analysis.")
+                    code_btn = gr.Button("📄 Show Code")
+                    code_output = gr.Code(label="Python Code", language="python", lines=20, interactive=False)
+                    code_btn.click(show_excel_code, [], [code_output])
+        
+              # --- Report Generator Tab ---
+                with gr.TabItem("📄 Generate Report"):
+                    gr.Markdown("Generate a comprehensive financial report")
+                    report_file = gr.File(label="Upload Excel", file_types=[".xlsx"])
+                    report_btn = gr.Button("📄 Generate Report")
+                    report_output = gr.Textbox(label="Report", lines=20, interactive=False)
+                    report_download = gr.File(label="Download Report")
+                    report_btn.click(generate_report, [report_file], [report_output, report_download])
+
+# end excel tab
+
+
+# excel example analysis
+        with gr.TabItem("📊 Excel Analyzer"):
+            gr.Markdown("Upload any Excel file to analyze it")
+    
+            # Upload file
+            file = gr.File(label="Upload Excel file (.xlsx)", file_types=[".xlsx"])
+    
+            # Analysis options
+            with gr.Row():
+                 analyze_btn = gr.Button("📊 Run Full Analysis")
+                 clear_btn = gr.Button("🗑️ Clear Output")
+    
+            # Output
+            output = gr.Textbox(label="Analysis Results", lines=30, interactive=False)
+    
+            def analyze_any_excel(file):
+                 if file is None:
+                     return "Please upload a file."
+        
+                 try:
+                     df = pd.read_excel(file.name)
+                     output_lines = []
             
-        if st.button("📈 인터랙티브 차트 생성"):
-            try:
-                if chart_type == "막대 그래프 (Bar)":
-                    fig = px.bar(st.session_state.current_df, x=x_axis, y=y_axis, title=f"{x_axis}별 {y_axis} 실적")
-                elif chart_type == "누적 막대 그래프 (Stacked Bar)":
-                    fig = px.bar(st.session_state.current_df, x=x_axis, y=y_axis, color=x_axis, title=f"{x_axis}별 {y_axis} 누적 구성")
-                elif chart_type == "선 그래프 (Line)":
-                    fig = px.line(st.session_state.current_df, x=x_axis, y=y_axis, title=f"{x_axis}에 따른 {y_axis} 추이")
-                elif chart_type == "영역 차트 (Area)":
-                    fig = px.area(st.session_state.current_df, x=x_axis, y=y_axis, title=f"{x_axis} 기준 {y_axis} 누적 볼륨")
-                elif chart_type == "산점도 (Scatter)":
-                    fig = px.scatter(st.session_state.current_df, x=x_axis, y=y_axis, title=f"{x_axis}와 {y_axis}의 상관 분포")
-                elif chart_type == "원형 차트 (Pie)":
-                    fig = px.pie(st.session_state.current_df, names=x_axis, values=y_axis, title=f"{x_axis} 기준 {y_axis} 마켓 셰어")
-                elif chart_type == "도넛 차트 (Donut)":
-                    fig = px.pie(st.session_state.current_df, names=x_axis, values=y_axis, hole=0.4, title=f"{x_axis} 기준 {y_axis} 점유율 (도넛형)")
-                
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"차트 생성 오류: {e}")
-
-    # --- 5. 사장님 보고용 전략 수립 엔진 ---
-    st.markdown("---")
-    st.subheader("🎯 사장님 보고용 대시보드 및 전략 수립 엔진")
+                    # Basic info
+                     output_lines.append("=" * 60)
+                     output_lines.append(f"📊 FILE: {file.name}")
+                     output_lines.append("=" * 60)
+                     output_lines.append(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+                     output_lines.append(f"Columns: {', '.join(df.columns.tolist())}")
+                     output_lines.append("")
+            
+                     # First few rows
+                     output_lines.append("📋 PREVIEW:")
+                     output_lines.append(df.head(5).to_string())
+                     output_lines.append("")
+            
+                     # Statistics for numeric columns
+                     numeric_cols = df.select_dtypes(include=[np.number]).columns
+                     if len(numeric_cols) > 0:
+                         output_lines.append("📊 NUMERIC STATISTICS:")
+                         output_lines.append(df[numeric_cols].describe().to_string())
+                         output_lines.append("")
+            
+                     # Missing values
+                     missing = df.isnull().sum()
+                     if missing.sum() > 0:
+                         output_lines.append("⚠️ MISSING VALUES:")
+                         for col, count in missing.items():
+                             if count > 0:
+                                 output_lines.append(f"  {col}: {count} missing")
+                         output_lines.append("")
+            
+                     # Export
+                     output_file = f"analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                     df.to_excel(output_file, index=False)
+                     output_lines.append(f"✅ Analysis exported to: {output_file}")
+            
+                     return "\n".join(output_lines)
+                 except Exception as e:
+                     return f"❌ Error: {e}"
     
-    if st.button("🚀 한 장의 통합 현황판(Dashboard) 생성"):
-        if model and (st.session_state.extracted_data or is_image):
-            with st.spinner("AI가 실무 엑셀 장부 입체 분석 및 K-IFRS 검증 중..."):
-                prompt = (
-                    f"당신은 사내 최고 권위의 데이터 과학자이자 수석 회계감사관입니다. 제공된 모든 리소스는 《회사에서 바로 통하는 실무 엑셀》 기반의 핵심 기업 데이터입니다.\n"
-                    f"데이터를 쪼갤 때 행과 열의 텍스트와 숫자를 단 한 줄도 누락하거나 흐리지 마시고, 정밀하게 연산하여 최고경영진(CEO) 보고 규격으로 작성해 주세요.\n\n"
-                    f"필수 출력 항목:\n"
-                    f"1. [경영 분석 현황판]: 매출 소계와 실적 데이터의 이상 징후(마이너스 매출, NaN 공백 등)를 정확히 짚어 요약해 주세요.\n"
-                    f"2. [K-IFRS 회계 검증]: 발견된 회계적 결함이나 장부 기록이 K-IFRS 몇 단원, 몇 절(예: 제1115호, 제1016호 등)의 문항에 위배되거나 적용되어야 하는지 명확히 감사 판단을 내려주세요.\n"
-                    f"3. [경영자 제언]: 자금 유동성 확보 및 운영 효율화를 위한 비상 자문 의견을 주십시오.\n"
-                    f"4. [경쟁사 분석 및 경쟁 전략]: 당사 부실 품목을 방어하고 시장 점유율을 독점할 핵심 차별화 전략을 제안해 주세요.\n\n"
-                    f"[입력된 통합 자원 데이터]:\n{st.session_state.extracted_data}"
-                )
-                
-                try:
-                    if is_image:
-                        response = model.generate_content([prompt, image_obj])
-                    else:
-                        response = model.generate_content(prompt)
-                    st.session_state.ceo_dashboard_result = response.text
-                except Exception as e:
-                    st.error(f"AI 연산 중 에러: {e}")
-        else:
-            st.error("Gemini API 키가 없거나 분석 대상 데이터가 로드되지 않았습니다.")
+            analyze_btn.click(analyze_any_excel, [file], [output])        
 
-    # 6. 대시보드 결과 출력 및 이메일 전송 [🌟 finally 세션 클로즈 디펜스 이식]
-    if st.session_state.ceo_dashboard_result:
-        st.info("📋 생성된 사장님 보고용 실시간 대시보드 결과")
-        st.markdown(st.session_state.ceo_dashboard_result)
-        
-        st.markdown("---")
-        st.subheader("📨 이메일 원클릭 사내 전송")
-        if st.button("📧 이메일로 이 대시보드 즉시 송신"):
-            if sender_email and sender_password and receiver_email:
-                with st.spinner("사내 메일 터널 전송 중..."):
-                    server = None  # finally 자원반환 스캔용 선언
-                    try:
-                        msg = MIMEMultipart()
-                        msg['From'] = sender_email
-                        msg['To'] = receiver_email
-                        msg['Subject'] = "🚨 [경영 보고] AI 기반 통합 경영 대시보드 및 K-IFRS 검증 보고서"
-                        msg.attach(MIMEText(st.session_state.ceo_dashboard_result, 'plain', 'utf-8'))
-                        
-                        # 포트 규격별 동적 보안 연결 수립
-                        if int(smtp_port) == 465:
-                            server = smtplib.SMTP_SSL(smtp_server, int(smtp_port), timeout=15)
-                        else:
-                            server = smtplib.SMTP(smtp_server, int(smtp_port), timeout=15)
-                            server.ehlo()
-                            server.starttls()  # 최신 STARTTLS 보안 프로토콜 주입
-                            server.ehlo()
-                        
-                        server.login(sender_email, sender_password)
-                        server.sendmail(sender_email, receiver_email, msg.as_string())
-                        st.success(f"✅ 사장님 메일({receiver_email})로 보고서 전송이 완료되었습니다!")
-                    except smtplib.SMTPAuthenticationError:
-                        st.error("❌ 메일 전송 실패: 로그인 인증 실패. 네이버 보안 토큰(앱 비밀번호) 입력을 확인하세요.")
-                    except Exception as e:
-                        st.error(f"메일 발송 오류: {e}")
-                    finally:
-                        # 🌟 연산 성공/실패 여부와 관계없이 메일 서버 소켓 자원을 100% 해제합니다.
-                        if server is not None:
-                            try:
-                                server.quit()
-                            except:
-                                pass
-            else:
-                st.warning("사이드바에 메일 송신자/수신자 정보 및 앱 비밀번호를 모두 입력해 주세요.")
-else:
-    st.info("왼쪽 사이드바에 Gemini API Key를 입력하면 장난감이 작동하기 시작합니다.")
+# end excel example analysis
 
 
 
+
+
+        with gr.TabItem("📋 Logs"):
+            log_output = gr.Textbox(label="Log Content", lines=20, interactive=False)
+            download_btn = gr.Button("📥 Download Log")
+
+            def get_log():
+                content, filename = export_log()
+                return content, filename
+
+            download_btn.click(get_log, outputs=[log_output, gr.File()])
+
+    clear_memory_btn.click(clear_memory, outputs=[])
+
+# --- Run ---
+if __name__ == "__main__":
+    demo.launch()
